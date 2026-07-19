@@ -74,6 +74,18 @@ type Permissions struct {
 	unifiedDiffContent   string
 	splitDiffContent     string
 
+	// Mouse state. The button hit compositor is rebuilt every Draw
+	// from the current button geometry so click and hover hit-testing
+	// stays in sync with the layout. mouseActive tracks whether the
+	// last interaction was via the mouse so hover styling only applies
+	// while the user is using the mouse.
+	buttonCompositor *lipgloss.Compositor
+	buttonScreenX    int
+	buttonScreenY    int
+	hoverX           int
+	hoverY           int
+	mouseActive      bool
+
 	help   help.Model
 	keyMap permissionsKeyMap
 }
@@ -234,6 +246,10 @@ func (p *Permissions) ToolCallID() string {
 func (p *Permissions) HandleMsg(msg tea.Msg) Action {
 	switch msg := msg.(type) {
 	case tea.KeyPressMsg:
+		// Keyboard navigation takes over from mouse hover mode so the
+		// selected highlight follows the keyboard cursor, not the last
+		// hovered button.
+		p.mouseActive = false
 		switch {
 		case key.Matches(msg, p.keyMap.Close):
 			// Escape denies the permission request.
@@ -278,6 +294,10 @@ func (p *Permissions) HandleMsg(msg tea.Msg) Action {
 				p.viewport, _ = p.viewport.Update(msg)
 			}
 		}
+	case tea.MouseClickMsg:
+		return p.handleMouseClick(msg)
+	case tea.MouseMotionMsg:
+		p.handleMouseMotion(msg)
 	case common.CoalescedWheelMsg:
 		if p.hasDiffView() {
 			if msg.DeltaX < 0 {
@@ -299,6 +319,33 @@ func (p *Permissions) HandleMsg(msg tea.Msg) Action {
 	}
 
 	return nil
+}
+
+// handleMouseClick processes a mouse click. If the click lands on a
+// button, that button is selected and its action is immediately
+// triggered, matching the behavior of pressing Enter on the keyboard
+// selection. Clicks outside the buttons are ignored.
+func (p *Permissions) handleMouseClick(msg tea.MouseClickMsg) Action {
+	idx := common.HitButtonIndex(p.buttonCompositor, msg.X, msg.Y)
+	if idx < 0 {
+		return nil
+	}
+	p.selectedOption = idx
+	return p.selectCurrentOption()
+}
+
+// handleMouseMotion updates the hover position so the next Draw can
+// highlight the button under the cursor. Any mouse motion activates
+// hover mode; keyboard input clears it. Redundant motion events (same
+// X/Y) are ignored to match the dedup the question feature applies in
+// ui.go.
+func (p *Permissions) handleMouseMotion(msg tea.MouseMotionMsg) {
+	if p.hoverX == msg.X && p.hoverY == msg.Y {
+		return
+	}
+	p.hoverX = msg.X
+	p.hoverY = msg.Y
+	p.mouseActive = true
 }
 
 func (p *Permissions) selectCurrentOption() tea.Msg {
@@ -391,7 +438,9 @@ func (p *Permissions) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor {
 
 	contentWidth := p.calculateContentWidth(width)
 	header := p.renderHeader(contentWidth)
-	buttons := p.renderButtons(contentWidth, fullscreen)
+	// Compute button layout once (without hover) to measure geometry.
+	btnLayout := p.computeButtonLayout(contentWidth, fullscreen)
+	buttonsHeight := lipgloss.Height(btnLayout.content)
 	// Pack the hints to the content width so they truncate cleanly instead
 	// of overflowing. The dialog frame supplies the padding, so this renders
 	// the hint line without the extra help view inset that renderDialogHelp
@@ -404,7 +453,7 @@ func (p *Permissions) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor {
 	// scrollable viewport into whatever height the fixed chrome leaves.
 	renderedContent := p.renderContent(contentWidth)
 	contentHeight := lipgloss.Height(renderedContent)
-	fixedHeight := lipgloss.Height(header) + lipgloss.Height(buttons) +
+	fixedHeight := lipgloss.Height(header) + buttonsHeight +
 		lipgloss.Height(helpView) + dialogStyle.GetVerticalFrameSize() + layoutSpacingLines
 	availableHeight := p.contentViewportHeight(forceFullscreen, maxHeight, fixedHeight, contentHeight)
 
@@ -438,9 +487,54 @@ func (p *Permissions) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor {
 	if content != "" {
 		parts = append(parts, "", content)
 	}
-	parts = append(parts, "", buttons, "", helpView)
+	parts = append(parts, "", btnLayout.content, "", helpView)
 
 	innerContent := lipgloss.JoinVertical(lipgloss.Left, parts...)
+	rendered := dialogStyle.Render(innerContent)
+
+	// Compute the centered rect so we can place the button hit
+	// compositor at the correct screen coordinates. This mirrors
+	// DrawCenterCursor but keeps the rect for hit-testing.
+	dialogW, dialogH := lipgloss.Size(rendered)
+	dialogW = min(dialogW, area.Dx())
+	dialogH = min(dialogH, area.Dy())
+	dialogRect := common.CenterRect(area, dialogW, dialogH)
+
+	// Compute the button row's screen position inside the dialog.
+	// The dialog frame (border + padding) sits above the content;
+	// the buttons follow header + blank + viewport content + blank.
+	hFrame := dialogStyle.GetHorizontalFrameSize() // border + padding on one side
+	vFrame := dialogStyle.GetVerticalFrameSize()
+	contentLeft := dialogRect.Min.X + hFrame/2
+	contentTop := dialogRect.Min.Y + vFrame/2
+	buttonY := contentTop + lipgloss.Height(header) + 1 + availableHeight + 1
+
+	// Determine the button group's X position based on alignment.
+	var buttonX int
+	switch btnLayout.align {
+	case lipgloss.Center:
+		buttonX = contentLeft + (contentWidth-btnLayout.groupWidth)/2
+	default: // Right
+		buttonX = contentLeft + contentWidth - btnLayout.groupWidth
+	}
+	if buttonX < contentLeft {
+		buttonX = contentLeft
+	}
+
+	// Build the hit compositor at the computed screen coordinates,
+	// then re-render buttons with hover styling applied.
+	p.buttonCompositor = p.buildButtonCompositor(btnLayout, buttonX, buttonY, contentWidth)
+	p.buttonScreenX = buttonX
+	p.buttonScreenY = buttonY
+	buttons := p.renderButtons(contentWidth, fullscreen)
+
+	// Reassemble with the hover-styled buttons.
+	parts = []string{header}
+	if content != "" {
+		parts = append(parts, "", content)
+	}
+	parts = append(parts, "", buttons, "", helpView)
+	innerContent = lipgloss.JoinVertical(lipgloss.Left, parts...)
 	DrawCenterCursor(scr, area, dialogStyle.Render(innerContent), nil)
 	return nil
 }
@@ -755,30 +849,111 @@ func (p *Permissions) renderContentPanel(content string, width int) string {
 	return panelStyle.Width(width).Render(content)
 }
 
-func (p *Permissions) renderButtons(contentWidth int, fullscreen bool) string {
-	buttons := []common.ButtonOpts{
+// buttonLayout holds the geometry of the rendered button group. It
+// is computed once per Draw so the hit compositor can be built at the
+// correct screen coordinates and hover styling can be applied before
+// the final render.
+type buttonLayout struct {
+	opts       []common.ButtonOpts
+	spacing    string // separator between buttons ("  " or "\n")
+	stacked    bool   // true when buttons wrap onto separate lines
+	align      lipgloss.Position
+	groupWidth int // visible width of the button group (excluding alignment padding)
+	content    string
+}
+
+// computeButtonLayout builds the button opts and rendered group for the
+// current selection state, without applying hover styling. The caller
+// applies hover via applyHover before the final render.
+func (p *Permissions) computeButtonLayout(contentWidth int, fullscreen bool) buttonLayout {
+	opts := []common.ButtonOpts{
 		{Text: "Allow", UnderlineIndex: 0, Selected: p.selectedOption == 0},
 		{Text: "Allow for Session", UnderlineIndex: 10, Selected: p.selectedOption == 1},
 		{Text: "Deny", UnderlineIndex: 0, Selected: p.selectedOption == 2},
 	}
 
-	content := common.ButtonGroup(p.com.Styles, buttons, "  ")
-
-	// Center when stacked or when the dialog fills the screen; otherwise
-	// hug the right edge next to the content. Right-aligning across a
-	// full-screen width leaves the buttons stranded in the corner.
+	spacing := "  "
+	content := common.ButtonGroup(p.com.Styles, opts, spacing)
 	align := lipgloss.Right
 	if fullscreen {
 		align = lipgloss.Center
 	}
+	stacked := false
 	if lipgloss.Width(content) > contentWidth {
-		content = common.ButtonGroup(p.com.Styles, buttons, "\n")
+		spacing = "\n"
+		stacked = true
 		align = lipgloss.Center
+		content = common.ButtonGroup(p.com.Styles, opts, spacing)
 	}
+
+	return buttonLayout{
+		opts:       opts,
+		spacing:    spacing,
+		stacked:    stacked,
+		align:      align,
+		groupWidth: lipgloss.Width(content),
+		content:    content,
+	}
+}
+
+// applyHover returns a new slice of button opts with Hovered flags set
+// based on the current hover position and the provided compositor. When
+// the mouse is not active (last interaction was via keyboard), no hover
+// flags are set.
+func (p *Permissions) applyHover(opts []common.ButtonOpts) []common.ButtonOpts {
+	out := make([]common.ButtonOpts, len(opts))
+	copy(out, opts)
+	if !p.mouseActive {
+		return out
+	}
+	hovered := common.HitButtonIndex(p.buttonCompositor, p.hoverX, p.hoverY)
+	for i := range out {
+		out[i].Hovered = i == hovered
+	}
+	return out
+}
+
+// buildButtonCompositor constructs the hit-test compositor for the
+// button group at the given screen coordinates. For stacked buttons
+// each button is placed on its own line, centered within contentWidth.
+func (p *Permissions) buildButtonCompositor(layout buttonLayout, x, y, contentWidth int) *lipgloss.Compositor {
+	if layout.stacked {
+		return p.buildStackedButtonCompositor(layout, x, y, contentWidth)
+	}
+	return common.ButtonHitCompositor(p.com.Styles, layout.opts, layout.spacing, x, y)
+}
+
+// buildStackedButtonCompositor builds a compositor where each button
+// is on its own line, centered within contentWidth to match the
+// center alignment applied by renderButtons in the stacked case.
+func (p *Permissions) buildStackedButtonCompositor(layout buttonLayout, x, y, contentWidth int) *lipgloss.Compositor {
+	if len(layout.opts) == 0 {
+		return nil
+	}
+	var layers []*lipgloss.Layer
+	for i, o := range layout.opts {
+		b := common.Button(p.com.Styles, o)
+		w := lipgloss.Width(b)
+		// Center each button within contentWidth, matching the
+		// lipgloss.Center alignment applied by renderButtons.
+		btnX := x + (contentWidth-w)/2
+		if btnX < x {
+			btnX = x
+		}
+		hitStr := strings.Repeat(" ", w)
+		layers = append(layers, lipgloss.NewLayer(hitStr).X(btnX).Y(y+i).ID(fmt.Sprintf("btn_%d", i)))
+	}
+	return lipgloss.NewCompositor(layers...)
+}
+
+func (p *Permissions) renderButtons(contentWidth int, fullscreen bool) string {
+	layout := p.computeButtonLayout(contentWidth, fullscreen)
+	opts := p.applyHover(layout.opts)
+	content := common.ButtonGroup(p.com.Styles, opts, layout.spacing)
 
 	return lipgloss.NewStyle().
 		Width(contentWidth).
-		Align(align).
+		Align(layout.align).
 		Render(content)
 }
 
